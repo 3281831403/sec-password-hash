@@ -7,13 +7,36 @@ docstring，实现必须逐条满足。
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
+import re
 from typing import Any, Callable, Iterable
 
 ALGORITHM = "pbkdf2_sha256"
 MIN_ITERATIONS = 100_000
 MIN_SALT_BYTES = 16
 DIGEST_BYTES = 32
+
+_B64_SEGMENT = re.compile(r"^[A-Za-z0-9_-]+$")
+_ITERATIONS_SEGMENT = re.compile(r"^(0|[1-9][0-9]*)$")
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _b64_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _b64_decode(segment: str) -> bytes:
+    if not segment or not _B64_SEGMENT.match(segment):
+        raise ValueError("非法的 base64 段")
+    if len(segment) % 4 == 1:
+        raise ValueError("非法的 base64 长度")
+    padded = segment + "=" * (-len(segment) % 4)
+    return base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
 
 
 def salt_bytes(entropy: Callable[[int], bytes], size: int = MIN_SALT_BYTES) -> bytes:
@@ -35,7 +58,18 @@ def salt_bytes(entropy: Callable[[int], bytes], size: int = MIN_SALT_BYTES) -> b
     契约要点：长度固定；同一熵源连续调用应当得到不同盐；不同调用方各自
     传入熵源，不得共享模块级盐。
     """
-    raise NotImplementedError("salt_bytes 尚未实现")
+    if not callable(entropy):
+        raise TypeError("entropy 必须是可调用对象")
+    if not _is_int(size):
+        raise TypeError("size 必须是 int")
+    if size < MIN_SALT_BYTES:
+        raise ValueError("size 不得小于 16")
+    salt = entropy(size)
+    if not isinstance(salt, bytes):
+        raise TypeError("entropy 必须返回 bytes")
+    if len(salt) != size:
+        raise ValueError("entropy 返回的字节数不等于 size")
+    return salt
 
 
 def derive(password: str, salt: bytes, iterations: int) -> bytes:
@@ -60,7 +94,19 @@ def derive(password: str, salt: bytes, iterations: int) -> bytes:
     相同密码、相同盐、相同迭代必须得到相同结果；盐变化一位，结果就必须
     整体不同；容差为 0。
     """
-    raise NotImplementedError("derive 尚未实现")
+    if not isinstance(password, str):
+        raise TypeError("password 必须是 str")
+    if not isinstance(salt, bytes):
+        raise TypeError("salt 必须是 bytes")
+    if not _is_int(iterations):
+        raise TypeError("iterations 必须是 int")
+    if len(salt) < MIN_SALT_BYTES:
+        raise ValueError("salt 不得短于 16 字节")
+    if iterations < MIN_ITERATIONS:
+        raise ValueError("iterations 不得小于 100000")
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations, dklen=DIGEST_BYTES
+    )
 
 
 def encode(salt: bytes, digest: bytes, iterations: int) -> str:
@@ -88,7 +134,19 @@ def encode(salt: bytes, digest: bytes, iterations: int) -> str:
 
     契约要点：编码必须自描述；容差为 0，不存储额外可变字段。
     """
-    raise NotImplementedError("encode 尚未实现")
+    if not isinstance(salt, bytes):
+        raise TypeError("salt 必须是 bytes")
+    if not isinstance(digest, bytes):
+        raise TypeError("digest 必须是 bytes")
+    if not _is_int(iterations):
+        raise TypeError("iterations 必须是 int")
+    if len(salt) < MIN_SALT_BYTES:
+        raise ValueError("salt 不得短于 16 字节")
+    if len(digest) != DIGEST_BYTES:
+        raise ValueError("digest 必须恰好为 32 字节")
+    if iterations < MIN_ITERATIONS:
+        raise ValueError("iterations 不得小于 100000")
+    return f"{ALGORITHM}${iterations}${_b64_encode(salt)}${_b64_encode(digest)}"
 
 
 def decode(encoded: str) -> dict[str, Any]:
@@ -116,7 +174,31 @@ def decode(encoded: str) -> dict[str, Any]:
 
     契约要点：迭代下限必须在这里校验；一条迭代为 1 的记录不得通过。
     """
-    raise NotImplementedError("decode 尚未实现")
+    if not isinstance(encoded, str):
+        raise TypeError("encoded 必须是 str")
+    parts = encoded.split("$")
+    if len(parts) != 4:
+        raise ValueError("记录必须恰好四段")
+    algorithm, iterations_text, salt_text, digest_text = parts
+    if algorithm != ALGORITHM:
+        raise ValueError("未知算法名")
+    if not _ITERATIONS_SEGMENT.match(iterations_text):
+        raise ValueError("iterations 必须是十进制无前导零整数")
+    iterations = int(iterations_text)
+    if iterations < MIN_ITERATIONS:
+        raise ValueError("iterations 不得小于 100000")
+    salt = _b64_decode(salt_text)
+    if len(salt) < MIN_SALT_BYTES:
+        raise ValueError("salt 不得短于 16 字节")
+    digest = _b64_decode(digest_text)
+    if len(digest) != DIGEST_BYTES:
+        raise ValueError("digest 必须恰好为 32 字节")
+    return {
+        "algorithm": algorithm,
+        "iterations": iterations,
+        "salt": salt,
+        "digest": digest,
+    }
 
 
 def verify(password: str, encoded: str) -> bool:
@@ -137,7 +219,12 @@ def verify(password: str, encoded: str) -> bool:
         下限、base64 损坏、类型错误等任何情况都返回 False。调用方不得被
         异常绕过，也不得靠捕获异常判断密码错误。
     """
-    raise NotImplementedError("verify 尚未实现")
+    try:
+        record = decode(encoded)
+        candidate = derive(password, record["salt"], record["iterations"])
+        return bool(hmac.compare_digest(candidate, record["digest"]))
+    except Exception:
+        return False
 
 
 def needs_rehash(encoded: str, policy: dict[str, Any]) -> bool:
@@ -157,7 +244,15 @@ def needs_rehash(encoded: str, policy: dict[str, Any]) -> bool:
     契约要点：算法和迭代两个维度都要比较；只比较算法会让弱迭代记录永远
     不升级。
     """
-    raise NotImplementedError("needs_rehash 尚未实现")
+    try:
+        record = decode(encoded)
+    except (TypeError, ValueError):
+        return True
+    if record["algorithm"] != policy["algorithm"]:
+        return True
+    if record["iterations"] < policy["iterations"]:
+        return True
+    return False
 
 
 def validate_policy(policy: dict[str, Any]) -> list[str]:
@@ -181,7 +276,18 @@ def validate_policy(policy: dict[str, Any]) -> list[str]:
     契约要点：盐长度下限必须检查；三个维度独立检查，问题应全部列出而不是
     在第一个错误处提前返回。
     """
-    raise NotImplementedError("validate_policy 尚未实现")
+    if not isinstance(policy, dict):
+        raise TypeError("policy 必须是 dict")
+    problems: list[str] = []
+    if policy.get("algorithm") != ALGORITHM:
+        problems.append("unknown_algorithm")
+    iterations = policy.get("iterations")
+    if not _is_int(iterations) or iterations < MIN_ITERATIONS:
+        problems.append("iterations_too_low")
+    salt_size = policy.get("salt_bytes")
+    if not _is_int(salt_size) or salt_size < MIN_SALT_BYTES:
+        problems.append("salt_too_short")
+    return problems
 
 
 def hash_batch(records: Iterable[dict[str, Any]], policy: dict[str, Any]) -> dict[str, str]:
@@ -208,4 +314,30 @@ def hash_batch(records: Iterable[dict[str, Any]], policy: dict[str, Any]) -> dic
         TypeError: policy 或 records 结构不符合约定。
         ValueError: 策略不合格、username 重复或记录字段非法。
     """
-    raise NotImplementedError("hash_batch 尚未实现")
+    if not isinstance(policy, dict):
+        raise TypeError("policy 必须是 dict")
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("策略不合格: " + ", ".join(problems))
+    entropy = policy.get("entropy")
+    if not callable(entropy):
+        raise TypeError("policy['entropy'] 必须是可调用对象")
+    if not hasattr(records, "__iter__"):
+        raise TypeError("records 必须是可迭代对象")
+
+    result: dict[str, str] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise TypeError("每条记录必须是 dict")
+        username = record.get("username")
+        password = record.get("password")
+        if not isinstance(username, str) or not username:
+            raise ValueError("username 必须是非空 str")
+        if not isinstance(password, str):
+            raise ValueError("password 必须是 str")
+        if username in result:
+            raise ValueError(f"username 重复: {username}")
+        salt = salt_bytes(entropy, policy["salt_bytes"])
+        digest = derive(password, salt, policy["iterations"])
+        result[username] = encode(salt, digest, policy["iterations"])
+    return result
